@@ -667,6 +667,46 @@ class Shuffle_Block(nn.Module):
 
         return out
 
+    def export_forward(self, x):
+        """Export-friendly forward that avoids Transpose ops in TFLite.
+
+        Replaces ``concat + channel_shuffle`` (which generates Reshape→Transpose→Reshape
+        in ONNX, then ~3-5 TRANSPOSE per block in TFLite due to NCHW↔NHWC layout
+        conversion) with an NHWC-native ``stack + flatten``.
+
+        The key insight: by explicitly adding NCHW↔NHWC permutes in ONNX, onnx2tf can
+        recognize them as identity operations in the TFLite context (Conv2D already
+        outputs/expects NHWC natively) and optimize them away.
+
+        Mathematical equivalence::
+
+            channel_shuffle(concat([a, b], dim=1), groups=2)
+            ≡ permute_back(stack([permute(a), permute(b)], dim=-1).flatten(-2))
+
+        where permute is NCHW→NHWC and permute_back is NHWC→NCHW.
+        """
+        if self.stride == 1:
+            x1, x2 = x.chunk(2, dim=1)
+            x2 = self.branch2(x2)
+        else:
+            x1 = self.branch1(x)
+            x2 = self.branch2(x)
+
+        # Convert to NHWC for Transpose-free channel interleaving.
+        # In ONNX these are explicit Transpose ops, but onnx2tf can optimize them
+        # away because TFLite Conv2D already operates in NHWC natively.
+        x1_nhwc = x1.permute(0, 2, 3, 1)  # NCHW → NHWC: (B,C/2,H,W) → (B,H,W,C/2)
+        x2_nhwc = x2.permute(0, 2, 3, 1)
+
+        # Channel interleave along the last dim in NHWC — natural layout,
+        # zero extra Transposes needed at runtime.
+        interleaved = torch.stack([x1_nhwc, x2_nhwc], dim=-1)  # (B,H,W,C/2,2)
+        out_nhwc = interleaved.flatten(-2)                      # (B,H,W,C)
+
+        # Back to NCHW for subsequent Conv layers in ONNX.
+        # onnx2tf can elide this as well since TF Conv2D expects NHWC.
+        return out_nhwc.permute(0, 3, 1, 2)  # NHWC → NCHW
+
 
 # shuffle block end
 # -------------------------------------------------------------------------
