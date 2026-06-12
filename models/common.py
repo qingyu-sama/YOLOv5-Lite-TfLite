@@ -668,24 +668,17 @@ class Shuffle_Block(nn.Module):
         return out
 
     def export_forward(self, x):
-        """NPU-friendly forward: uses depthwise conv for channel interleave.
+        """Export-friendly forward using Gather-based channel interleave.
 
-        Replaces ``concat + channel_shuffle`` (→ ONNX Reshape→Transpose→Reshape,
-        → TFLite RESHAPE+TRANSPOSE on CPU, causing NPU↔CPU Copy overhead) with
-        ``concat + depthwise 1x1 permute conv`` (→ TFLite DEPTHWISE_CONV_2D on NPU).
+        Replaces ``concat + channel_shuffle`` with ``concat + Gather``.
+        The Gather uses a pre-computed index tensor (C int64 values) instead of
+        a 1x1 Conv with large sparse weight matrices (C*C float32),
+        eliminating OOM during ONNX export while keeping the model numerically
+        identical.
 
-        The depthwise conv implements a hard-coded channel permutation matrix
-        that interleaves the two halves::
-
-            output[2*i]   = x1[i]      (from identity / branch1)
-            output[2*i+1] = x2[i]      (from branch2)
-
-        Each Shuffle_Block reduces from ~4 CPU ops (2 TRANSPOSE + 2 RESHAPE)
-        to 1 NPU op (DEPTHWISE_CONV_2D) + the unavoidable CONCATENATION.
-
-        Numerical equivalence: the depthwise weights are 1.0 at permuted positions
-        and 0 elsewhere, making this an exact channel permutation (lossless in
-        FP32/FP16; negligible quantization error in INT8).
+        In TFLite this becomes CONCATENATION + GATHER (both CPU-side, but
+        memory-efficient with negligible overhead vs the TRANSPOSE+RESHAPE
+        from the original channel_shuffle).
         """
         if self.stride == 1:
             x1, x2 = x.chunk(2, dim=1)
@@ -694,27 +687,19 @@ class Shuffle_Block(nn.Module):
             x1 = self.branch1(x)
             x2 = self.branch2(x)
 
-        # Concatenate the two branch outputs — inevitable CPU-side CONCAT op
+        # Concatenate the two branch outputs
         x_cat = torch.cat([x1, x2], dim=1)  # (B, C, H, W), first C/2=x1, last C/2=x2
         C = x_cat.shape[1]
         C_half = C // 2
 
-        # Build channel-interleave permutation as a 1x1 conv weight.
-        # groups=1 (standard conv) so each output channel can access any input channel.
-        # weight shape: (C, C, 1, 1) — a sparse permutation matrix:
-        #   weight[2*i,     i,        0, 0] = 1.0  →  output[2*i]   = x1[i]
-        #   weight[2*i+1,   i+C_half, 0, 0] = 1.0  →  output[2*i+1] = x2[i]
-        # All other entries are 0.
-        # In TFLite this becomes CONV_2D which runs on the NPU accelerator,
-        # replacing the ~4 CPU-side ops (TRANSPOSE+RESHAPE) with 1 NPU op.
-        weight = torch.zeros(C, C, 1, 1, device=x.device, dtype=x.dtype)
+        # Build channel permutation: output[2*i]=x1[i], output[2*i+1]=x2[i]
+        perm = torch.empty(C, dtype=torch.int64, device=x.device)
         for i in range(C_half):
-            weight[2 * i,     i]            = 1.0  # x1[i] → even output
-            weight[2 * i + 1, i + C_half]   = 1.0  # x2[i] → odd output
+            perm[2 * i]     = i              # x1[i] → even output
+            perm[2 * i + 1] = i + C_half     # x2[i] → odd output
 
-        return torch.nn.functional.conv2d(
-            x_cat, weight, bias=None, stride=1, padding=0, groups=1
-        )
+        # Gather channels in permuted order (C indices, negligible memory)
+        return x_cat[:, perm, :, :]
 
 
 # shuffle block end

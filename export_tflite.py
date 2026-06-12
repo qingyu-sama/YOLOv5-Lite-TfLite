@@ -368,12 +368,7 @@ class TFLiteExporter:
         self.im = torch.zeros(
             self.args.batch_size, 3, *self.imgsz
         ).to(self.device)
-
-        # Dry run inference
         print(f"  Input shape: {tuple(self.im.shape)}")
-        with torch.no_grad():
-            y = self.model(self.im)
-        print(f"  Output type: {type(y)}, shape: {y.shape if isinstance(y, torch.Tensor) else 'N/A'}")
 
         # ONNX export
         try:
@@ -394,6 +389,7 @@ class TFLiteExporter:
         print(f"  Dynamic axes: {dynamic}")
         print(f"  Output names: {output_names}")
 
+        t_trace = time.time()
         torch.onnx.export(
             self.model,
             self.im,
@@ -403,7 +399,10 @@ class TFLiteExporter:
             input_names=["images"],
             output_names=output_names,
             dynamic_axes=dynamic,
+            dynamo=False,  # Use TorchScript exporter (much faster than torch.export path)
         )
+        t_trace = time.time() - t_trace
+        print(f"  torch.onnx.export: {t_trace:.1f}s")
 
         # Load and verify ONNX model
         onnx_model = onnx.load(str(self.f_onnx))
@@ -411,13 +410,16 @@ class TFLiteExporter:
         print(f"  ONNX model verified OK")
 
         # Simplify with onnxslim
+        t_slim = 0.0
         if not self.args.no_onnxsim:
             try:
                 import onnxslim
                 print(f"  Simplifying with onnxslim {onnxslim.__version__}...")
+                t_slim = time.time()
                 onnx_model = onnxslim.slim(onnx_model)
-                onnx.save(onnx_model, str(self.f_onnx))
-                print(f"  ONNX model simplified OK")
+                t_slim = time.time() - t_slim
+                # Defer save — metadata added below, then written once
+                print(f"  ONNX model simplified OK ({t_slim:.1f}s)")
             except ImportError:
                 print(f"  WARNING: onnxslim not installed, skipping simplification")
             except Exception as e:
@@ -442,7 +444,9 @@ class TFLiteExporter:
 
         self.metadata = metadata
         mb = os.path.getsize(self.f_onnx) / 1e6
+        # Report sub-stage timings
         print(f"  ONNX model saved: {self.f_onnx} ({mb:.2f} MB)")
+        print(f"  Sub-timings: trace={t_trace:.1f}s  slim={t_slim:.1f}s  total={t_trace + t_slim:.1f}s")
         return str(self.f_onnx)
 
     def collect_calibration_images(self):
@@ -524,22 +528,28 @@ class TFLiteExporter:
             print(f"  Generated {num_images} synthetic images, shape={synthetic.shape}")
             return synthetic
 
-        # Preprocess images
+        # Preprocess images in parallel (cv2.imread + letterbox release the GIL)
         num_images = min(self.args.num_calibration_images, len(image_paths))
         image_paths = image_paths[:num_images]
         print(f"  Using {num_images} images for calibration")
         print(f"  Target size: {self.imgsz}")
 
-        images_bhwc = []
-        for i, img_path in enumerate(image_paths):
-            try:
-                img = self._preprocess_image(str(img_path))
-                images_bhwc.append(img)
-                if (i + 1) % 50 == 0:
-                    print(f"    Processed {i + 1}/{num_images} images...")
-            except Exception as e:
-                print(f"    WARNING: Failed to process {img_path}: {e}")
-                continue
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        n_workers = min(8, (os.cpu_count() or 4))
+        results = [None] * num_images
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(self._preprocess_image_worker, i, str(p)): i
+                       for i, p in enumerate(image_paths)}
+            for future in as_completed(futures):
+                i, img, err = future.result()
+                if err:
+                    print(f"    WARNING: Failed to process {image_paths[i]}: {err}")
+                else:
+                    results[i] = img
+
+        images_bhwc = [x for x in results if x is not None]
+        print(f"    Loaded {len(images_bhwc)}/{num_images} images ({n_workers} workers)")
 
         if not images_bhwc:
             raise RuntimeError("No valid calibration images could be loaded. "
@@ -577,6 +587,18 @@ class TFLiteExporter:
         img = img[:, :, ::-1]  # BGR → RGB
 
         return img.astype(np.float32)
+
+    def _preprocess_image_worker(self, idx, img_path):
+        """Thread-safe wrapper for parallel calibration image loading.
+
+        Returns (idx, img, err) so the main thread can preserve ordering
+        via pre-allocated results list.
+        """
+        try:
+            img = self._preprocess_image(img_path)
+            return (idx, img, None)
+        except Exception as e:
+            return (idx, None, str(e))
 
     def convert_to_tflite(self):
         """Convert ONNX model to TensorFlow Lite via onnx2tf.
@@ -617,19 +639,27 @@ class TFLiteExporter:
         # Prepare calibration data for INT8 quantization
         np_data = None
         calib_npy_path = None
+        t_calib = 0.0
         if self.args.int8:
+            import tempfile
             print(f"\n  Preparing INT8 calibration data...")
+            t_calib = time.time()
             calib_images = self.collect_calibration_images()
-            calib_npy_path = self.output_dir / "tmp_tflite_int8_calibration_images.npy"
-            np.save(str(calib_npy_path), calib_images)  # BHWC float32
-            print(f"  Calibration data saved: {calib_npy_path}")
+            # Use tempfile (tmpfs on Linux, avoids disk I/O; guaranteed cleanup)
+            fd, calib_npy_path = tempfile.mkstemp(
+                suffix=".npy", prefix="tflite_int8_calib_"
+            )
+            os.close(fd)  # keep the path, release fd — numpy will open it itself
+            np.save(calib_npy_path, calib_images)  # BHWC float32
+            t_calib = time.time() - t_calib
+            print(f"  Calibration data saved: {calib_npy_path} ({t_calib:.1f}s)")
             print(f"  Calibration shape: {calib_images.shape}, dtype: {calib_images.dtype}")
 
             # onnx2tf expects calibration data in format:
             # [["input_name", npy_path, [[[[min_vals]]]], [[[[max_vals]]]]]]
             np_data = [
                 ["images",
-                 str(calib_npy_path),
+                 calib_npy_path,
                  [[[[0, 0, 0]]]],      # min values (RGB)
                  [[[[255, 255, 255]]]]  # max values (RGB)
                 ]
@@ -650,7 +680,10 @@ class TFLiteExporter:
         print(f"    full_integer_quant: {self.args.full_integer}")
         print(f"    disable_group_convolution: False (matching ultralytics — only True for tfjs/edgetpu)")
 
-        t_start = time.time()
+        if t_calib > 0:
+            print(f"  Calibration collection: {t_calib:.1f}s")
+
+        t_convert = time.time()
 
         # Determine verbosity level
         verbosity = "debug" if self.args.verbose else "error"
@@ -672,42 +705,59 @@ class TFLiteExporter:
             disable_group_convolution=False,
         )
 
-        elapsed = time.time() - t_start
-        print(f"\n  onnx2tf conversion completed in {elapsed:.1f}s")
+        t_convert = time.time() - t_convert
+        print(f"\n  onnx2tf.convert: {t_convert:.1f}s")
 
-        # Post-process TFLite files (mirroring ultralytics' file management)
+        # --- Single rglob pass for all TFLite file management ---
+        t_files = time.time()
+        self._tflite_files = list(self.saved_model_dir.rglob("*.tflite"))
+        tflite_files = self._tflite_files
+
         if self.args.int8:
-            # Clean up calibration npy file
-            if calib_npy_path and calib_npy_path.exists():
-                calib_npy_path.unlink()
+            # Clean up calibration tempfile
+            if calib_npy_path and os.path.exists(calib_npy_path):
+                os.unlink(calib_npy_path)
                 print(f"  Removed temporary calibration file: {calib_npy_path}")
 
-            # Rename dynamic_range_quant → int8
-            for file in self.saved_model_dir.rglob("*_dynamic_range_quant.tflite"):
-                new_name = file.with_name(
-                    file.stem.replace("_dynamic_range_quant", "_int8") + file.suffix
-                )
-                file.rename(new_name)
-                print(f"  Renamed: {file.name} → {new_name.name}")
+            for file in tflite_files:
+                fname = file.name
+                # Rename dynamic_range_quant → int8
+                if "_dynamic_range_quant" in fname:
+                    new_name = file.with_name(
+                        fname.replace("_dynamic_range_quant", "_int8")
+                    )
+                    file.rename(new_name)
+                    print(f"  Renamed: {fname} → {new_name.name}")
 
-            # Delete int16 activation files (not needed)
-            for file in self.saved_model_dir.rglob("*_integer_quant_with_int16_act.tflite"):
-                file.unlink()
-                print(f"  Removed: {file.name}")
+                # Delete int16 activation files (not needed)
+                elif "_integer_quant_with_int16_act" in fname:
+                    file.unlink()
+                    print(f"  Removed: {fname}")
 
-            # Handle full_integer_quant files
-            for file in self.saved_model_dir.rglob("*_full_integer_quant.tflite"):
-                new_name = file.with_name(
-                    file.stem.replace("_full_integer_quant", "_full_integer_quant") + file.suffix
-                )
-                print(f"  Full integer quant model: {file.name}")
+                # Log full_integer_quant files
+                elif "_full_integer_quant" in fname:
+                    print(f"  Full integer quant model: {fname}")
 
-        # List all generated TFLite files
-        self._list_tflite_files()
+            # Refresh list after renames/deletes
+            self._tflite_files = list(self.saved_model_dir.rglob("*.tflite"))
+            tflite_files = self._tflite_files
 
-        # Add metadata to TFLite files
-        for tflite_file in self.saved_model_dir.rglob("*.tflite"):
+        # List all generated TFLite files (single pass)
+        self._list_tflite_files(tflite_files)
+
+        # Add metadata to TFLite files (reuse cached list)
+        for tflite_file in tflite_files:
             self._add_tflite_metadata(tflite_file)
+
+        t_files = time.time() - t_files
+        print(f"  File management: {t_files:.1f}s")
+
+        # Store sub-timings for summary table
+        self._sub_timing = {
+            'calib_collect': t_calib,
+            'onnx2tf_convert': t_convert,
+            'file_manage': t_files,
+        }
 
         return keras_model
 
@@ -749,30 +799,26 @@ class TFLiteExporter:
             print(f"    onnxruntime: MISSING ✗")
             raise
 
-        # Pre-download calibration file for onnx2tf (fixes known issue)
-        # onnx2tf requires this file for internal calibration during conversion.
-        # With numpy 2.x, the file may need allow_pickle=True to load.
+        # Ensure onnx2tf calibration sample file exists (lazy init, skip if valid)
         onnx2tf_file = Path("calibration_image_sample_data_20x128x128x3_float32.npy")
-        if onnx2tf_file.exists():
-            # Ensure the file is numpy 2.x compatible (no pickled objects)
-            try:
-                data = np.load(str(onnx2tf_file), allow_pickle=True)
-                np.save(str(onnx2tf_file), data.astype(np.float32))
-                print(f"    onnx2tf calibration sample: {data.shape} ✓")
-            except Exception as e:
-                print(f"    WARNING: calibration sample corrupt, recreating...")
-                onnx2tf_file.unlink(missing_ok=True)
-
-        if not onnx2tf_file.exists():
-            # Generate synthetic calibration sample data
+        if not onnx2tf_file.exists() or onnx2tf_file.stat().st_size < 1024:
+            # Generate once — no need to re-load/re-save on every export
             data = np.random.randint(0, 255, (20, 128, 128, 3)).astype(np.float32)
             np.save(str(onnx2tf_file), data)
             print(f"    onnx2tf calibration sample: created {data.shape} ✓")
+        # else: file exists and is valid — skip to avoid disk I/O
 
-    def _list_tflite_files(self):
-        """List all TFLite files in the saved_model directory with their sizes."""
+    def _list_tflite_files(self, tflite_files=None):
+        """List all TFLite files in the saved_model directory with their sizes.
+
+        Args:
+            tflite_files: Optional pre-collected list of Path objects (avoids redundant rglob).
+        """
         print(f"\n  Generated TFLite models:")
-        tflite_files = sorted(self.saved_model_dir.rglob("*.tflite"))
+        if tflite_files is None:
+            tflite_files = sorted(self.saved_model_dir.rglob("*.tflite"))
+        else:
+            tflite_files = sorted(tflite_files)
         if not tflite_files:
             print(f"    (none found)")
             return
@@ -819,6 +865,23 @@ class TFLiteExporter:
         except Exception as e:
             print(f"    WARNING: Failed to add metadata to {tflite_path.name}: {e}")
 
+    def _print_timing(self, timing, total):
+        """Print a timing summary table for the export pipeline."""
+        print(f"\n  --- Timing Summary ---")
+        for stage, sec in timing.items():
+            pct = (sec / total * 100) if total > 0 else 0
+            bar = '#' * int(pct / 2)
+            print(f"  {stage:20s} {sec:6.1f}s ({pct:5.1f}%) {bar}")
+        # Also print sub-timings from convert_to_tflite if available
+        for key, label in [('calib_collect', '  calib_collect'),
+                           ('onnx2tf_convert', '  onnx2tf_convert'),
+                           ('file_manage', '  file_manage')]:
+            if hasattr(self, '_sub_timing') and self._sub_timing.get(key, 0) > 0:
+                sec = self._sub_timing[key]
+                pct = (sec / total * 100) if total > 0 else 0
+                print(f"  {label:20s} {sec:6.1f}s ({pct:5.1f}%)")
+        print(f"  {'TOTAL':20s} {total:6.1f}s")
+
     def export(self):
         """Run the complete TFLite export pipeline.
 
@@ -828,6 +891,7 @@ class TFLiteExporter:
             Path: Path to the primary exported TFLite file.
         """
         t_start = time.time()
+        timing = {}  # stage → seconds
 
         print(f"\n{'='*60}")
         print(f"YOLOv5-Lite TFLite Export Pipeline")
@@ -841,33 +905,42 @@ class TFLiteExporter:
         print(f"  Device: {self.device}")
 
         # Step 1-2: Load and prepare model
+        t0 = time.time()
         self.load_model()
+        timing['load_model'] = time.time() - t0
 
         # Note: attempt_load() already calls model.fuse() internally.
-        # Calling fuse() again would fail on already-fused Shuffle_Block modules.
 
-        # Step 4: Prepare for ONNX export
+        # Step 3: Prepare for ONNX export
+        t0 = time.time()
         self.prepare_for_export()
+        timing['prepare_export'] = time.time() - t0
 
-        # Step 5: Export ONNX
+        # Step 4: Export ONNX
+        t0 = time.time()
         f_onnx = self.export_onnx()
+        timing['onnx_export'] = time.time() - t0
 
         if self.args.onnx_only:
             elapsed = time.time() - t_start
             print(f"\n{'='*60}")
             print(f"ONNX export complete ({elapsed:.1f}s)")
             print(f"ONNX model: {f_onnx}")
+            self._print_timing(timing, elapsed)
             print(f"{'='*60}")
             return f_onnx
 
-        # Step 6-8: Convert to TFLite via onnx2tf
+        # Step 5: Convert to TFLite via onnx2tf (includes calibration collection)
+        t0 = time.time()
         self.convert_to_tflite()
+        timing['tflite_convert'] = time.time() - t0
 
         # Summarize
         elapsed = time.time() - t_start
         print(f"\n{'='*60}")
         print(f"TFLite export complete ({elapsed:.1f}s)")
         print(f"{'='*60}")
+        self._print_timing(timing, elapsed)
         print(f"\nOutput directory: {self.saved_model_dir}")
         print(f"\nQuantization summary:")
         if self.args.int8:
@@ -894,7 +967,8 @@ class TFLiteExporter:
             print(f"    - Model: *_float32.tflite")
 
         print(f"\nAvailable TFLite models:")
-        for tflite_file in sorted(self.saved_model_dir.rglob("*.tflite")):
+        for tflite_file in sorted(getattr(self, '_tflite_files',
+                                          list(self.saved_model_dir.rglob("*.tflite")))):
             size_mb = tflite_file.stat().st_size / 1e6
             print(f"  {tflite_file} ({size_mb:.2f} MB)")
 
